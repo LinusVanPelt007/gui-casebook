@@ -1,0 +1,36 @@
+import {unzipSync,zipSync,strFromU8,strToU8} from 'fflate';
+import {DOMParser,XMLSerializer} from '@xmldom/xmldom';
+import {BookData,Edits,limits,dateColumns,dateSerial,numericColumns} from './casebook';
+const NS='http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+const xml=(b:Uint8Array)=>new DOMParser().parseFromString(strFromU8(b),'application/xml');
+const els=(e:any,name:string):any[]=>Array.from(e.getElementsByTagNameNS('*',name));
+const text=(e:any)=>e?.textContent??'';
+function unpack(bytes:Uint8Array){if(bytes.length>30*1024*1024)throw Error('Upload a casebook smaller than 30 MB.');let expanded=0;const files=unzipSync(bytes,{filter:f=>{expanded+=f.originalSize;if(expanded>120*1024*1024)throw Error('Workbook contents exceed 120 MB.');return true;}});if(!files['xl/workbook.xml']||!files['xl/_rels/workbook.xml.rels'])throw Error('Upload an unencrypted .xlsx workbook.');return files;}
+function paths(files:Record<string,Uint8Array>){const rels=els(xml(files['xl/_rels/workbook.xml.rels']),'Relationship'),out:Record<string,string>={};for(const s of els(xml(files['xl/workbook.xml']),'sheet')){const rel=rels.find(r=>r.getAttribute('Id')===s.getAttribute('r:id'));if(!rel)throw Error('A worksheet link is missing.');const target=rel.getAttribute('Target'),p=target.startsWith('/')?target.slice(1):'xl/'+target.replace(/^\.\//,'');if(!files[p])throw Error('A worksheet is missing.');out[s.getAttribute('name')]=p;}return out;}
+function validationLists(doc:any):Record<string,string[]>{const out:Record<string,string[]>={};for(const dv of els(doc,'dataValidation')){if(dv.getAttribute('type')!=='list')continue;const f=text(els(dv,'formula1')[0]).trim();if(!/^".*"$/.test(f))continue;const items=f.slice(1,-1).split(',').map(v=>v.trim()).filter(Boolean);for(const range of(dv.getAttribute('sqref')??'').split(/\s+/)){const m=/^([A-Z]+)\d*(?::([A-Z]+)\d*)?$/.exec(range);if(!m)continue;for(let n=columnNumber(m[1]);n<=columnNumber(m[2]??m[1]);n++)out[columnName(n)]??=items;}}return out;}
+function columnName(n:number){let s='';while(n>0){const r=(n-1)%26;s=String.fromCharCode(65+r)+s;n=Math.floor((n-1)/26);}return s;}
+export function parseWorkbook(bytes:Uint8Array):BookData{
+ const files=unpack(bytes),sheetPaths=paths(files),strings=files['xl/sharedStrings.xml']?els(xml(files['xl/sharedStrings.xml']),'si').map(s=>els(s,'t').map(text).join('')):[],sheets:BookData['sheets']={},profile:Record<string,string>={};
+ for(const [name,path]of Object.entries(sheetPaths)){const doc=xml(files[path]),headers:Record<string,string>={},rows=[];for(const r of els(doc,'row')){const row=+r.getAttribute('r'),values:Record<string,string>={};for(const c of els(r,'c')){const col=c.getAttribute('r').replace(/\d+$/,''),t=c.getAttribute('t'),value=t==='s'?strings[+text(els(c,'v')[0])]??'':t==='inlineStr'?els(c,'t').map(text).join(''):text(els(c,'v')[0]);if(value)values[col]=value;}if(row===4)Object.assign(headers,values);if(row>=5&&values.A)rows.push({row,values});if(name==='Analyst Profile'&&values.A)profile[values.A]=values.B??'';}sheets[name]={path,headers,rows,capacity:limits[name]??10000,lists:validationLists(doc)};}
+ const expected:Record<string,Record<string,string>>={'Case Register':{A:'Case ID',C:'Case / Project',N:'Time Class',X:'What I Did'},'Session Ledger':{A:'Session ID',C:'Case ID',I:'Time Class',L:'Hours Entered'},'Evidence Index':{A:'Proof ID',B:'Case ID',F:'File / Link'},'Competency Evidence':{A:'Demo ID',B:'Case ID',E:'Skill ID',N:'Review Status'},'Portfolio':{A:'Item ID',B:'Case ID',D:'Title',J:'Approval'},'Competency Catalog':{A:'Skill ID',C:'Skill'},'Domain Framework':{A:'ID',C:'Practice Domain'}};
+ for(const [s,cols]of Object.entries(expected))for(const [col,label]of Object.entries(cols))if(sheets[s]?.headers[col]!==label)throw Error(`This workbook does not match the supported Casebook v3 layout: ${s}, ${label}.`);
+ return {sheets,profile,sheetNames:Object.keys(sheets)};
+}
+export function exportWorkbook(original:Uint8Array,edits:Edits):Uint8Array{
+ const files=unpack(original),sheetPaths=paths(files);
+ for(const [sheet,changes]of Object.entries(edits)){
+  if(!sheetPaths[sheet])throw Error('A changed sheet is missing.');const doc=xml(files[sheetPaths[sheet]]),data=els(doc,'sheetData')[0];
+  for(const [rowNumber,values]of Object.entries(changes)){const n=+rowNumber;let row=els(data,'row').find(r=>+r.getAttribute('r')===n);if(!row){row=doc.createElementNS(NS,'row');row.setAttribute('r',rowNumber);const next=els(data,'row').find(r=>+r.getAttribute('r')>n);data.insertBefore(row,next??null);}
+   for(const [col,value]of Object.entries(values)){const ref=col+rowNumber;let c=els(row,'c').find(c=>c.getAttribute('r')===ref);if(!c){c=doc.createElementNS(NS,'c');c.setAttribute('r',ref);const template=els(data,'row').find(r=>r.getAttribute('r')==='5');const templateCell=template&&els(template,'c').find(t=>t.getAttribute('r')===col+'5');if(templateCell?.hasAttribute('s'))c.setAttribute('s',templateCell.getAttribute('s'));const next=els(row,'c').find(c=>columnNumber(c.getAttribute('r').replace(/\d+$/,''))>columnNumber(col));row.insertBefore(c,next??null);}while(c.firstChild)c.removeChild(c.firstChild);c.removeAttribute('t');
+    const numeric=(dateColumns[sheet]??[]).includes(col)&&/^\d{4}-\d{2}-\d{2}$/.test(value)||(numericColumns[sheet]??[]).includes(col)&&value!==''&&Number.isFinite(+value);
+    if(numeric){const v=doc.createElementNS(NS,'v');v.textContent=(dateColumns[sheet]??[]).includes(col)?dateSerial(value):value;c.appendChild(v);}else{c.setAttribute('t','inlineStr');const is=doc.createElementNS(NS,'is'),t=doc.createElementNS(NS,'t');t.setAttribute('xml:space','preserve');t.textContent=value;is.appendChild(t);c.appendChild(is);}
+   }
+  }
+  const dim=els(doc,'dimension')[0];if(dim){const ref=dim.getAttribute('ref'),last=Math.max(...Object.keys(changes).map(Number),+(/\d+$/.exec(ref)?.[0]??0));dim.setAttribute('ref',ref.replace(/\d+$/,String(last)));}files[sheetPaths[sheet]]=strToU8(new XMLSerializer().serializeToString(doc));
+ }
+ for(const path of Object.values(sheetPaths)){const doc=xml(files[path]);let changed=false;for(const c of els(doc,'c'))if(els(c,'f').length){for(const v of els(c,'v'))c.removeChild(v);changed=true;}if(changed)files[path]=strToU8(new XMLSerializer().serializeToString(doc));}
+ const wb=xml(files['xl/workbook.xml']);let calc=els(wb,'calcPr')[0];if(!calc){calc=wb.createElementNS(NS,'calcPr');wb.documentElement!.appendChild(calc);}calc.setAttribute('fullCalcOnLoad','1');calc.setAttribute('forceFullCalc','1');calc.setAttribute('calcMode','auto');files['xl/workbook.xml']=strToU8(new XMLSerializer().serializeToString(wb));
+ if(files['xl/calcChain.xml']){delete files['xl/calcChain.xml'];const relDoc=xml(files['xl/_rels/workbook.xml.rels']);for(const r of els(relDoc,'Relationship'))if(r.getAttribute('Type').endsWith('/calcChain'))r.parentNode.removeChild(r);files['xl/_rels/workbook.xml.rels']=strToU8(new XMLSerializer().serializeToString(relDoc));const ct=xml(files['[Content_Types].xml']);for(const r of els(ct,'Override'))if(r.getAttribute('PartName')==='/xl/calcChain.xml')r.parentNode.removeChild(r);files['[Content_Types].xml']=strToU8(new XMLSerializer().serializeToString(ct));}
+ return zipSync(files,{level:6});
+}
+function columnNumber(col:string){return [...col].reduce((v,c)=>v*26+c.charCodeAt(0)-64,0);}
